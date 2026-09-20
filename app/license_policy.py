@@ -19,10 +19,13 @@ extraneous）。因此与 :mod:`app.sbom` 一样，这里不做任何版本选�
 
 两个输出列表各自只取决于快照、目标环境、锁定清单与策略集合，均按
 规范化包名排序；每条附 ``paths``（根包到该包的全部最短路径，字典序
-排序，语义与 /dependency-paths 一致）。命中包按包名顺序逐个查询路径，
-某条查询的最短路径条数超过固定预算（app.paths.PATH_COUNT_LIMIT）时
-抛 :exc:`app.paths.PathCountLimit`（命中首个超限项），由路由层映射为
-409 ``status=limit``，不构造任何路径列表。
+排序，语义与 /dependency-paths 一致）。一次请求中**所有命中包待返回
+的最短路径共享同一个请求级预算**（app.paths.PATH_COUNT_LIMIT，1000
+条）：命中包按包名顺序逐个查询路径并累计条数，加入下一目标会使累计
+超过 1000 时立即抛 :exc:`app.paths.PathCountLimit`（``target`` 指向
+该目标、``used`` 恒为 1001、``limit`` 为 1000），由路由层映射为
+409 ``status=limit``，不构造任何路径列表、不返回部分业务结果；恰好
+累计到 1000 仍成功返回。
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from collections.abc import Collection
 from packaging.version import Version
 
 from .audit import _find_candidate
-from .paths import shortest_paths
+from .paths import PathCountBudget, shortest_paths
 from .repository import Repository
 from .spdx import (
     DENY,
@@ -58,11 +61,15 @@ def evaluate_license_policy(
     （节点集恰为锁中全部包）。返回
     ``{"violations": [...], "unknowns": [...]}``，两项均按包名排序；
     包的 SPDX 表达式非法时抛 LicenseExpressionError（定位到包与版本）。
-    命中包按包名顺序逐个查询最短路径，某条查询超过固定条数预算时抛
-    :exc:`app.paths.PathCountLimit`（首个超限项），不构造路径列表。
+    命中包按包名顺序逐个查询最短路径，各目标的路径条数累计到同一个
+    请求级 :class:`~app.paths.PathCountBudget`（上限 1000，violations
+    与 unknowns 合在一起累计）：加入下一目标会使累计超限即抛
+    :exc:`app.paths.PathCountLimit`（首个超限目标、``used`` 恒为 1001），
+    不构造路径列表、不返回部分结果。
     """
     violations: list[dict] = []
     unknowns: list[dict] = []
+    budget = PathCountBudget()
 
     for name in sorted(graph):
         locked = current_lock[name]
@@ -82,9 +89,9 @@ def evaluate_license_policy(
             decision = evaluate_spdx_expression(node, allow, deny)
 
         if decision == DENY:
-            violations.append(_entry(name, graph, root_name, license_text))
+            violations.append(_entry(name, graph, root_name, license_text, budget))
         elif decision == UNKNOWN:
-            unknowns.append(_entry(name, graph, root_name, license_text))
+            unknowns.append(_entry(name, graph, root_name, license_text, budget))
 
     return {"violations": violations, "unknowns": unknowns}
 
@@ -94,10 +101,11 @@ def _entry(
     graph: dict[str, list[str]],
     root_name: str,
     license_text: str | None,
+    budget: PathCountBudget,
 ) -> dict:
     """构造一个命中包的输出条目：名称、许可证文本与全部最短根路径。"""
     return {
         "name": name,
         "license": license_text,
-        "paths": shortest_paths(graph, root_name, name),
+        "paths": shortest_paths(graph, root_name, name, budget),
     }

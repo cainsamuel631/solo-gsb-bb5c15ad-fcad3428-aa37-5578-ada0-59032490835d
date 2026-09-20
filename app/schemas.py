@@ -735,8 +735,11 @@ class InvalidLockResponse(BaseModel):
 class PathLimitResponse(BaseModel):
     """最短路径条数超过固定预算（1000 条）：409，未构造路径列表。
 
-    /dependency-paths、/license-policy、/lock-diff 三个路径查询接口共用；
-    一次查询涉及多个目标时按既有包名顺序命中首个超限项。
+    /dependency-paths、/license-policy、/lock-diff 三个路径查询接口共用。
+    /dependency-paths 为单目标查询；/license-policy 与 /lock-diff 一次
+    请求的所有目标共享请求级预算，按各自既有的确定性顺序累计条数，加入
+    下一目标会使累计超过 1000 时该目标即触发超限响应（不返回部分业务
+    结果）。
     """
 
     model_config = {"extra": "forbid"}
@@ -749,12 +752,18 @@ class PathLimitResponse(BaseModel):
     used: int = Field(
         ...,
         description=(
-            "停止时的饱和路径计数：条数超过预算即饱和为 limit+1，"
-            "故超限时恒为 limit+1，与真实条数无关。"
+            "停止时的饱和路径计数：单目标自身超限或请求级累计加入下一"
+            "目标超限，均饱和报告为 limit+1，故超限时恒为 1001，与真实"
+            "条数及此前累计值无关。"
         ),
     )
     limit: int = Field(
-        ..., description="单次最短路径查询的路径条数预算（固定 1000）。"
+        ...,
+        description=(
+            "路径条数预算（固定 1000）：/dependency-paths 为单次查询"
+            "预算；/license-policy、/lock-diff 为一次请求所有待返回最短"
+            "路径共享的请求级预算。"
+        ),
     )
 
 

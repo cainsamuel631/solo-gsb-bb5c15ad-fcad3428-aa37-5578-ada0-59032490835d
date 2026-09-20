@@ -17,18 +17,23 @@ PEP 440 等价的版本（``1.0`` 与 ``1.0.0``）不产生变化项。每个变
 在某一侧不可达的变化项（added/removed）该侧路径为空数组 ``[]``。
 
 四类变化各自只取决于快照、目标环境与两份锁定清单，列表均按规范化包名
-排序；结果与输入（包键 / 候选列表 / 锁键）顺序无关。变化项按既有顺序
-（added → removed → upgraded/downgraded，各按包名）逐个查询最短路径，
-某条查询的条数超过固定预算（app.paths.PATH_COUNT_LIMIT）时抛
-:exc:`app.paths.PathCountLimit`（命中首个超限项），由路由层映射为
-409 ``status=limit``，不构造任何路径列表。
+排序；结果与输入（包键 / 候选列表 / 锁键）顺序无关。一次请求中**所有
+变化项待返回的最短路径共享同一个请求级预算**
+（app.paths.PATH_COUNT_LIMIT，1000 条；added/removed 只有一侧路径，
+升降级项前后两侧各计一次）：变化项按既有顺序
+（added → removed → upgraded/downgraded，各按包名；每项内先
+before_paths 后 after_paths）逐个查询并跨 before/after 两侧累计条数，
+加入下一查询会使累计超过 1000 时立即抛 :exc:`app.paths.PathCountLimit`
+（``target`` 指向该变化项、``used`` 恒为 1001、``limit`` 为 1000），
+由路由层映射为 409 ``status=limit``，不构造任何路径列表、不返回部分
+业务结果；恰好累计到 1000 仍成功返回。
 """
 
 from __future__ import annotations
 
 from packaging.version import Version
 
-from .paths import build_locked_graph, shortest_paths
+from .paths import PathCountBudget, build_locked_graph, shortest_paths
 from .repository import Repository
 
 
@@ -44,9 +49,13 @@ def diff_locks(
     入参为同一份仓库快照与同一目标环境下解析出的两份锁（版本为 PEP 440
     Version）。返回 ``{"added", "removed", "upgraded", "downgraded"}``
     四个列表，各列表按规范化包名排序；每项含名称、前后版本与前后侧的
-    全部最短根路径（不可达一侧为 ``[]``）。某条最短路径查询超过固定
-    条数预算时抛 :exc:`app.paths.PathCountLimit`（按 added → removed →
-    upgraded/downgraded、各按包名的既有顺序命中首个超限项）。
+    全部最短根路径（不可达一侧为 ``[]``）。所有变化项的路径条数跨
+    before/after 两侧累计到同一个请求级
+    :class:`~app.paths.PathCountBudget`（上限 1000），按 added、
+    removed、upgraded/downgraded 各类内部按包名、项内先 before 后
+    after 的既有顺序逐个查询：加入下一查询会使累计超限即抛
+    :exc:`app.paths.PathCountLimit`（指向首个超限变化项、``used`` 恒为
+    1001），不构造路径列表、不返回部分结果。
     """
     before_graph = build_locked_graph(
         repo, root_name=root_name, current_lock=before_lock
@@ -57,6 +66,9 @@ def diff_locks(
     before_reachable = set(before_graph)
     after_reachable = set(after_graph)
 
+    # 请求级共享预算：所有变化项在 before/after 两侧的路径条数合在一起
+    # 累计 1000 条额度，按下面的既有确定性顺序逐个查询。
+    budget = PathCountBudget()
     added: list[dict] = []
     removed: list[dict] = []
     upgraded: list[dict] = []
@@ -68,7 +80,7 @@ def diff_locks(
             "before_version": None,
             "after_version": str(after_lock[name]),
             "before_paths": [],
-            "after_paths": shortest_paths(after_graph, root_name, name),
+            "after_paths": shortest_paths(after_graph, root_name, name, budget),
         })
 
     for name in sorted(before_reachable - after_reachable):
@@ -76,7 +88,7 @@ def diff_locks(
             "name": name,
             "before_version": str(before_lock[name]),
             "after_version": None,
-            "before_paths": shortest_paths(before_graph, root_name, name),
+            "before_paths": shortest_paths(before_graph, root_name, name, budget),
             "after_paths": [],
         })
 
@@ -90,8 +102,8 @@ def diff_locks(
             "name": name,
             "before_version": str(old),
             "after_version": str(new),
-            "before_paths": shortest_paths(before_graph, root_name, name),
-            "after_paths": shortest_paths(after_graph, root_name, name),
+            "before_paths": shortest_paths(before_graph, root_name, name, budget),
+            "after_paths": shortest_paths(after_graph, root_name, name, budget),
         }
         if new > old:
             upgraded.append(entry)

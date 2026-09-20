@@ -7,6 +7,14 @@ BFS 建立最短前驱图，先按层做饱和计数：条数超过固定预算 
 /license-policy、/lock-diff 任一查询超限均返回 409 status=limit
 （含目标包、used=1001、limit=1000），多个目标按既有包名顺序稳定命中
 首个超限项；未超限时仍返回全部最短路径且排序不变。
+
+/license-policy 与 /lock-diff 一次请求要为多个目标返回路径，修复后
+这些路径**共享同一个请求级 1000 条预算**：按既有确定性目标顺序累计
+（lock-diff 跨 before/after 两侧累计），加入下一目标会使累计超过 1000
+即立即返回 409（target 指向该目标、used 固定 1001、limit 1000），不
+返回部分业务结果；恰好累计到 1000 的目标仍成功。/dependency-paths 为
+单目标查询，预算每请求独立，单目标边界（1001 条失败）与恰好 1000 条
+成功的行为保持不变。
 """
 
 from __future__ import annotations
@@ -307,23 +315,61 @@ def test_license_policy_under_budget_returns_all_paths():
 
 
 # --------------------------------------------------------------------- #
-# 4. POST /lock-diff：变化项路径超限 409，按既有包名顺序命中首个
+# 4. POST /lock-diff：变化项路径超限 409，按既有顺序命中首个
 # --------------------------------------------------------------------- #
-def _diff_repo_and_locks(sinks):
-    """before：app 1.0 -> helper；after：app 2.0 -> 10 层菱形 -> 各 sink。"""
-    repo, after = layered_repo_lock(10, sinks)
-    repo["app"] = [
-        c("2.0", [d("l1a"), d("l1b")], license="MIT"),
-        c("1.0", [d("helper")], license="MIT"),
-    ]
-    repo["helper"] = [c("1.0", license="MIT")]
-    before = {"app": "1.0", "helper": "1.0"}
-    after["app"] = "2.0"
+def _wide_fan_repo_and_locks(width):
+    """after：app 2.0 -> w0..w{width-1} -> newpkg；before：仅 app 1.0。
+
+    变化项：app 升级（前后各 1 条单节点路径）；newpkg added（after 侧
+    width 条路径）；w0..w{width-1} added（各 1 条，包名排在 newpkg 之后）。
+    """
+    repo = {
+        "app": [
+            c("2.0", [d(f"w{i}") for i in range(width)], license="MIT"),
+            c("1.0", license="MIT"),
+        ],
+        "newpkg": [c("1.0", license="MIT")],
+    }
+    for i in range(width):
+        repo[f"w{i}"] = [c("1.0", [d("newpkg")], license="MIT")]
+    before = {"app": "1.0"}
+    after = {"app": "2.0", "newpkg": "1.0"}
+    for i in range(width):
+        after[f"w{i}"] = "1.0"
+    return repo, before, after
+
+
+def _two_fan_two_sinks(n_a, n_b):
+    """after：app 2.0 分别经两组中间节点汇聚到 newpkg-a / newpkg-b。
+
+    中间节点名为 z-a* / z-b*（字典序排在两个 sink 之后），各 sink 的
+    after 侧最短路径分别为 n_a / n_b 条；before 仅 app 1.0。
+    """
+    deps_a = [d(f"z-a{i}") for i in range(n_a)]
+    deps_b = [d(f"z-b{j}") for j in range(n_b)]
+    repo = {
+        "app": [
+            c("2.0", deps_a + deps_b, license="MIT"),
+            c("1.0", license="MIT"),
+        ],
+        "newpkg-a": [c("1.0", license="MIT")],
+        "newpkg-b": [c("1.0", license="MIT")],
+    }
+    for i in range(n_a):
+        repo[f"z-a{i}"] = [c("1.0", [d("newpkg-a")], license="MIT")]
+    for j in range(n_b):
+        repo[f"z-b{j}"] = [c("1.0", [d("newpkg-b")], license="MIT")]
+    before = {"app": "1.0"}
+    after = {"app": "2.0", "newpkg-a": "1.0", "newpkg-b": "1.0"}
+    for i in range(n_a):
+        after[f"z-a{i}"] = "1.0"
+    for j in range(n_b):
+        after[f"z-b{j}"] = "1.0"
     return repo, before, after
 
 
 def test_lock_diff_added_package_over_budget_409():
-    repo, before, after = _diff_repo_and_locks(["newpkg"])
+    repo, before, after = _wide_fan_repo_and_locks(1001)
     r = query_diff(repo, before, after)
     assert r.status_code == 409, r.text
     body = r.json()
@@ -336,47 +382,72 @@ def test_lock_diff_added_package_over_budget_409():
 
 def test_lock_diff_first_exceeding_target_in_name_order():
     """多个变化项都超限时，按既有包名顺序稳定命中首个超限项。"""
-    repo, before, after = _diff_repo_and_locks(["newpkg-b", "newpkg-a"])
+    repo, before, after = _two_fan_two_sinks(1001, 1001)
     body = query_diff(repo, before, after).json()
     assert body["status"] == "limit"
-    assert body["target"] == "newpkg-a"  # newpkg-a < newpkg-b
+    assert body["target"] == "newpkg-a"  # newpkg-a < newpkg-b < z-*
+    # 输入重排（包键、候选、锁键顺序）不改变命中的首个超限项。
+    body2 = query_diff(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(before.items()))),
+        dict(reversed(list(after.items()))),
+    ).json()
+    assert body2 == body
 
 
 def test_lock_diff_upgraded_package_after_side_over_budget():
-    """升降级项在 after 图中路径超限：before 侧正常、after 侧触发 409。"""
-    repo, after = layered_repo_lock(10, ["shared"])
-    repo["shared"] = [c("2.0", license="MIT"), c("1.0", license="MIT")]
-    # before：app 1.0 直连 shared 1.0（单条路径）；after：app 2.0 经 10 层
-    # 菱形到 shared 2.0（1024 条路径）。shared 两侧均可达且版本升高。
-    repo["app"] = [
-        c("2.0", [d("l1a"), d("l1b")], license="MIT"),
-        c("1.0", [d("shared")], license="MIT"),
-    ]
+    """升降级项在 after 图中路径超限：before 侧正常、after 侧触发 409。
+
+    构造一个依赖环：before（app 1.0 直连 sink 1.0，sink 1.0 再指向全部
+    中间节点，中间节点回指 sink）到 sink 只有 1 条最短路径；after
+    （app 2.0 经全部中间节点到 sink 2.0）有 1001 条。两份锁节点集相同，
+    唯一变化项是 app 与 sink 的升级。
+    """
+    width = 1001
+    repo = {
+        "app": [
+            c("2.0", [d(f"z{i}") for i in range(width)], license="MIT"),
+            c("1.0", [d("shared")], license="MIT"),
+        ],
+        "shared": [
+            c("2.0", license="MIT"),
+            c("1.0", [d(f"z{i}") for i in range(width)], license="MIT"),
+        ],
+    }
+    for i in range(width):
+        repo[f"z{i}"] = [c("1.0", [d("shared")], license="MIT")]
     before = {"app": "1.0", "shared": "1.0"}
-    after["app"] = "2.0"
-    after["shared"] = "2.0"
+    after = {"app": "2.0", "shared": "2.0"}
+    for i in range(width):
+        before[f"z{i}"] = "1.0"
+        after[f"z{i}"] = "1.0"
     r = query_diff(repo, before, after)
     assert r.status_code == 409, r.text
     body = r.json()
     assert body["status"] == "limit"
-    assert body["target"] == "shared"
+    assert body["target"] == "shared"  # app(2) + shared.before(1) 后 after 超限
+    assert body["used"] == 1001
 
 
 def test_lock_diff_under_budget_returns_all_paths():
     """未超限：变化项仍附前后图中的全部最短路径，分类与排序不变。"""
-    repo, after = layered_repo_lock(9, ["newpkg"])
-    repo["app"] = [
-        c("2.0", [d("l1a"), d("l1b")], license="MIT"),
-        c("1.0", [d("helper")], license="MIT"),
-    ]
-    repo["helper"] = [c("1.0", license="MIT")]
+    repo = {
+        "app": [
+            c("2.0", [d("w0"), d("w1")], license="MIT"),
+            c("1.0", [d("helper")], license="MIT"),
+        ],
+        "w0": [c("1.0", [d("newpkg")], license="MIT")],
+        "w1": [c("1.0", [d("newpkg")], license="MIT")],
+        "newpkg": [c("1.0", license="MIT")],
+        "helper": [c("1.0", license="MIT")],
+    }
     before = {"app": "1.0", "helper": "1.0"}
-    after["app"] = "2.0"
+    after = {"app": "2.0", "w0": "1.0", "w1": "1.0", "newpkg": "1.0"}
     r = query_diff(repo, before, after)
     assert r.status_code == 200, r.text
     body = r.json()
     added = {item["name"]: item for item in body["added"]}
-    assert len(added["newpkg"]["after_paths"]) == 512
+    assert len(added["newpkg"]["after_paths"]) == 2
     assert added["newpkg"]["after_paths"] == sorted(added["newpkg"]["after_paths"])
     assert added["newpkg"]["before_paths"] == []
     assert [item["name"] for item in body["removed"]] == ["helper"]
@@ -384,7 +455,7 @@ def test_lock_diff_under_budget_returns_all_paths():
 
 def test_lock_diff_invalid_lock_still_invalid_lock_not_limit():
     """任一份锁无效优先于路径预算：仍返回 409 invalid_lock。"""
-    repo, before, after = _diff_repo_and_locks(["newpkg"])
+    repo, before, after = _wide_fan_repo_and_locks(1001)
     del after["newpkg"]  # newpkg 可达但未锁定 -> missing
     r = query_diff(repo, before, after)
     assert r.status_code == 409
@@ -392,3 +463,219 @@ def test_lock_diff_invalid_lock_still_invalid_lock_not_limit():
     assert body["status"] == "invalid_lock"
     assert body["after"]["valid"] is False
     assert body["after"]["issues"][0]["type"] == "missing"
+
+
+# --------------------------------------------------------------------- #
+# 5. 请求级共享预算：一次请求所有待返回最短路径共享 1000 条额度
+#    （/license-policy 与 /lock-diff；/dependency-paths 单目标不变）
+# --------------------------------------------------------------------- #
+def _policy_two_fan(n_a, n_b):
+    """一张有效锁图：app 经两组中间节点汇聚到 sink-a / sink-b。
+
+    中间节点（z-a*/z-b*）都是 MIT（允许，不产生路径查询）；两个 sink
+    声明 GPL-3.0-only（拒绝），各自最短路径分别为 n_a / n_b 条且包名
+    顺序为 sink-a < sink-b < z-*。
+    """
+    deps_a = [d(f"z-a{i}") for i in range(n_a)]
+    deps_b = [d(f"z-b{j}") for j in range(n_b)]
+    repo = {
+        "app": [c("1.0", deps_a + deps_b, license="MIT")],
+        "sink-a": [c("1.0", license="GPL-3.0-only")],
+        "sink-b": [c("1.0", license="GPL-3.0-only")],
+    }
+    lock = {"app": "1.0", "sink-a": "1.0", "sink-b": "1.0"}
+    for i in range(n_a):
+        repo[f"z-a{i}"] = [c("1.0", [d("sink-a")], license="MIT")]
+        lock[f"z-a{i}"] = "1.0"
+    for j in range(n_b):
+        repo[f"z-b{j}"] = [c("1.0", [d("sink-b")], license="MIT")]
+        lock[f"z-b{j}"] = "1.0"
+    return repo, lock
+
+
+def test_policy_two_targets_each_under_budget_but_total_over_409():
+    """两个目标各 600/500 条（均 < 1000），合计 1100 > 1000：409。
+
+    按包名顺序 sink-a 先累计 600，加入 sink-b 会超限即立即返回，target
+    指向 sink-b，used 固定 1001，且不返回任何部分业务结果。
+    """
+    repo, lock = _policy_two_fan(600, 500)
+    r = query_policy(repo, lock)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["status"] == "limit"
+    assert body["target"] == "sink-b"
+    assert body["used"] == 1001
+    assert body["limit"] == 1000
+    assert "violations" not in body and "unknowns" not in body
+
+
+def test_policy_two_targets_total_exactly_1000_succeeds():
+    """两目标合计恰好 1000（500+500）：边界不超限，正常 200 返回全部路径。"""
+    repo, lock = _policy_two_fan(500, 500)
+    r = query_policy(repo, lock)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    violations = {e["name"]: e for e in body["violations"]}
+    assert sorted(violations) == ["sink-a", "sink-b"]
+    assert len(violations["sink-a"]["paths"]) == 500
+    assert len(violations["sink-b"]["paths"]) == 500
+
+
+def test_policy_shared_budget_limit_deterministic_on_input_reorder():
+    """合计超限时输入重排（仓库键/锁键顺序）：409 响应逐字节一致。"""
+    repo, lock = _policy_two_fan(600, 500)
+    body1 = query_policy(repo, lock).json()
+    body2 = query_policy(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    ).json()
+    assert body1 == body2
+    assert body1["target"] == "sink-b"
+    assert body1["used"] == 1001 and body1["limit"] == 1000
+
+
+def _cross_side_cycle_repo_and_locks(n_a, n_b):
+    """跨 before/after 两侧累计用的环构造（两份锁节点集完全相同）。
+
+    * app 1.0 直连 sink-a 1.0；sink-a 1.0 指向全部 za*/zb* 中间节点；
+      za{i} 回指 sink-a、zb{j} 指向 sink-b（before 图）。
+    * app 2.0 直连全部中间节点；sink-a/sink-b 锁 2.0 且无依赖（after 图）。
+
+    变化项只有 app、sink-a、sink-b 三个升级；路径条数：
+    app 前后各 1；sink-a before=1、after=n_a；sink-b before=after=n_b
+    （before 经 app->sink-a->zb{j}->sink-b 长度 3；after 长度 2）。
+    每个单侧查询都不超过 1000，但两侧累计可以越过 1000。
+    """
+    deps_a = [d(f"za{i}") for i in range(n_a)]
+    deps_b = [d(f"zb{j}") for j in range(n_b)]
+    repo = {
+        "app": [
+            c("2.0", deps_a + deps_b, license="MIT"),
+            c("1.0", [d("sink-a")], license="MIT"),
+        ],
+        "sink-a": [
+            c("2.0", license="MIT"),
+            c("1.0", deps_a + deps_b, license="MIT"),
+        ],
+        "sink-b": [
+            c("2.0", license="MIT"),
+            c("1.0", license="MIT"),
+        ],
+    }
+    for i in range(n_a):
+        repo[f"za{i}"] = [c("1.0", [d("sink-a")], license="MIT")]
+    for j in range(n_b):
+        repo[f"zb{j}"] = [c("1.0", [d("sink-b")], license="MIT")]
+    before = {"app": "1.0", "sink-a": "1.0", "sink-b": "1.0"}
+    after = {"app": "2.0", "sink-a": "2.0", "sink-b": "2.0"}
+    for i in range(n_a):
+        before[f"za{i}"] = "1.0"
+        after[f"za{i}"] = "1.0"
+    for j in range(n_b):
+        before[f"zb{j}"] = "1.0"
+        after[f"zb{j}"] = "1.0"
+    return repo, before, after
+
+
+def test_lock_diff_cross_side_budget_accumulates_over_both_sides():
+    """跨 before/after 两侧累计：每个单侧查询 ≤ 600，但合计越过 1000。
+
+    app(1+1) + sink-a(before 1 + after 600) = 603；sink-b 的 before_paths
+    再计 500 即 1103 > 1000，立即 409，target 指向 sink-b，used=1001，
+    无部分结果。
+    """
+    repo, before, after = _cross_side_cycle_repo_and_locks(600, 500)
+    r = query_diff(repo, before, after)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["status"] == "limit"
+    assert body["target"] == "sink-b"
+    assert body["used"] == 1001
+    assert body["limit"] == 1000
+    assert not ({"added", "removed", "upgraded", "downgraded"} & set(body))
+
+
+def test_lock_diff_cross_side_total_exactly_1000_succeeds():
+    """两侧累计恰好 1000（app 2 + sink-a 1+499 + sink-b 249+249）：200。"""
+    repo, before, after = _cross_side_cycle_repo_and_locks(499, 249)
+    r = query_diff(repo, before, after)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    upgraded = {item["name"]: item for item in body["upgraded"]}
+    assert len(upgraded["sink-a"]["before_paths"]) == 1
+    assert len(upgraded["sink-a"]["after_paths"]) == 499
+    assert len(upgraded["sink-b"]["before_paths"]) == 249
+    assert len(upgraded["sink-b"]["after_paths"]) == 249
+
+
+def test_lock_diff_shared_budget_limit_deterministic_on_input_reorder():
+    """跨侧累计超限时输入重排（仓库键/两份锁键顺序）：409 响应逐字节一致。"""
+    repo, before, after = _cross_side_cycle_repo_and_locks(600, 500)
+    body1 = query_diff(repo, before, after).json()
+    body2 = query_diff(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(before.items()))),
+        dict(reversed(list(after.items()))),
+    ).json()
+    assert body1 == body2
+    assert body1["target"] == "sink-b"
+    assert body1["used"] == 1001 and body1["limit"] == 1000
+
+
+def test_dependency_paths_shared_budget_change_does_not_affect_single_target():
+    """共享预算改造不改变 /dependency-paths：单目标恰好 1000 条仍成功。"""
+    width = 1000
+    repo = {
+        "app": [c("1.0", [d(f"w{i}") for i in range(width)], license="MIT")],
+        "target": [c("1.0", license="MIT")],
+    }
+    lock = {"app": "1.0", "target": "1.0"}
+    for i in range(width):
+        repo[f"w{i}"] = [c("1.0", [d("target")], license="MIT")]
+        lock[f"w{i}"] = "1.0"
+    r = query_paths(repo, lock, "target")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reachable"] is True
+    assert len(body["paths"]) == 1000
+
+
+def test_policy_huge_second_target_saturates_under_partial_budget():
+    """预算被首个目标用掉一部分后，次目标指数级条数仍快速饱和为 1001。
+
+    首个命中包占 999 条；第二目标是 20 层分层菱形（真实 2**20 条）。
+    共享预算只剩 1 条额度：按层饱和计数在 2**10 层即饱和到 1001 并立即
+    409（先计数、后判定、不重建路径），target 指向 sink-b、used 恒为
+    1001，进程不被指数级路径拖垮。
+    """
+    # 999 路宽汇聚（中间节点 MIT，不命中策略），sink-a 拒绝。
+    deps = [d(f"w{i}") for i in range(999)]
+    repo = {"app": [c("1.0", deps + [d("l1a"), d("l1b")], license="MIT")]}
+    lock = {"app": "1.0"}
+    for i in range(999):
+        repo[f"w{i}"] = [c("1.0", [d("sink-a")], license="MIT")]
+        lock[f"w{i}"] = "1.0"
+    # 20 层分层菱形 -> sink-b（拒绝），真实 2**20 条最短路径。
+    for i in range(1, 21):
+        for s in ("a", "b"):
+            node = f"l{i}{s}"
+            node_deps = (
+                [d(f"l{i + 1}a"), d(f"l{i + 1}b")]
+                if i < 20 else [d("sink-b")]
+            )
+            repo[node] = [c("1.0", node_deps, license="MIT")]
+            lock[node] = "1.0"
+    repo["sink-a"] = [c("1.0", license="GPL-3.0-only")]
+    repo["sink-b"] = [c("1.0", license="GPL-3.0-only")]
+    lock["sink-a"] = "1.0"
+    lock["sink-b"] = "1.0"
+
+    r = query_policy(repo, lock)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["status"] == "limit"
+    assert body["target"] == "sink-b"  # sink-a 先计 999，sink-b 无剩余额度
+    assert body["used"] == 1001
+    assert body["limit"] == 1000
+

@@ -29,8 +29,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**，按请求的
 `allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
-某命中包的最短路径条数超过固定预算 **1000** 时整体返回
-**409 / `status:"limit"`**（按包名顺序命中首个超限项）；
+一次请求所有命中包的最短路径**共享请求级条数预算 1000**（按包名顺序
+累计，加入下一目标即超限）时整体返回
+**409 / `status:"limit"`**（`target` 指向该目标、`used` 固定 1001，
+不返回部分业务结果；恰好累计 1000 成功）；
 非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
 `/lock-diff` 在**同一份仓库快照与同一目标环境**下提交 `before_lock` 与
 `after_lock` 两份锁定清单：两份锁**各自独立复用 `/audit-lock` 的同一套
@@ -38,8 +40,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 均有效时**只比较根可达包**，按规范化包名输出 `added` / `removed` /
 `upgraded` / `downgraded`（版本方向按 PEP 440 判断），每个变化项同时
 给出其在前后依赖图中的**全部最短根路径**（不存在的一侧为空数组）；
-某变化项的最短路径条数超过固定预算 **1000** 时整体返回
-**409 / `status:"limit"`**（按既有包名顺序命中首个超限项）。
+所有变化项的最短路径**跨 before/after 两侧共享请求级条数预算
+1000**（按既有顺序累计，加入下一查询即超限）时整体返回
+**409 / `status:"limit"`**（`target` 指向该变化项、`used` 固定 1001，
+不返回部分业务结果；恰好累计 1000 成功）。
 `/explain-version` 做**反事实版本解释**：沿用 `/resolve` 的仓库、根约束
 与目标环境，先按原规则求出**基准锁**（目标包不可达返回 422），再把
 `target_package` 强制钉在 `target_version` 上整体重解——可行时返回新锁
@@ -1297,7 +1301,7 @@ curl -s -X POST http://localhost:8000/sbom \
 | `root` | 规范化（PEP 503）后的根包名 |
 | `violations` | 判定为**拒绝**的包列表，**按规范化包名排序**；允许的包不出现 |
 | `unknowns` | 判定为**未知**的包列表（含未提供许可证的包），**按规范化包名排序** |
-| `violations[]` / `unknowns[]` | 每项为 `{"name", "license", "paths"}`：`name` 为规范化包名；`license` 为该包锁定版本的原始 SPDX 表达式文本（未提供时为 `null`）；`paths` 为根包到该包的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序；根包自身为单节点路径 `[root]`）。命中包按包名顺序逐个查询路径，某条查询的条数超过固定预算 1000 时整体返回 **409 / `status:"limit"`**（命中首个超限项），不构造任何路径列表 |
+| `violations[]` / `unknowns[]` | 每项为 `{"name", "license", "paths"}`：`name` 为规范化包名；`license` 为该包锁定版本的原始 SPDX 表达式文本（未提供时为 `null`）；`paths` 为根包到该包的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序；根包自身为单节点路径 `[root]`）。**一次请求所有命中包的路径条数共享请求级预算 1000**（violations 与 unknowns 合在一起，按包名顺序逐个累计）：加入下一目标会使累计超过 1000 即整体返回 **409 / `status:"limit"`**（`target` 指向该目标、`used` 固定 1001），不构造任何路径列表、不返回部分业务结果；恰好累计 1000 成功 |
 
 ```bash
 curl -s -X POST http://localhost:8000/license-policy \
@@ -1362,13 +1366,18 @@ curl -s -X POST http://localhost:8000/license-policy \
   策略中按完整字面列出才会命中。
 - 输出只取决于快照、目标环境、锁定清单与 allow/deny 集合：两个列表按
   包名排序、路径按字典序排序，重复请求逐字节一致。
+- 路径条数预算是**请求级共享**的：所有命中包（violations 与 unknowns
+  一起）按包名顺序逐个查询，条数累计到同一个 1000 上限，加入下一目标
+  会超限即整体 409（无部分结果）；因此两个各自只有几百条路径的命中包
+  也可能因合计超过 1000 触发 409，截断位置只取决于包名顺序，与仓库键/
+  锁键的输入顺序无关。
 
 `/license-policy` 的状态码：
 
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
-| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或某命中包的最短路径条数超过固定预算 1000：`status: "limit"`，含 `target`（按包名顺序命中的首个超限包）/ `used`（恒为 1001）/ `limit`，未构造路径列表 |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或一次请求所有命中包的最短路径条数累计超过请求级共享预算 1000：`status: "limit"`，含 `target`（加入后会使累计超限的那个包）/ `used`（固定 1001）/ `limit`，不构造路径列表、不返回部分业务结果 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`、`AND`/`OR` 任一侧缺少空白分隔，如 `MIT OR(Apache-2.0)`、`(MIT)AND(Apache-2.0)`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
 ### `POST /lock-diff`
@@ -1415,7 +1424,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | `added` / `removed` / `upgraded` / `downgraded` | 四类变化列表，各自**按规范化包名排序**；无变化时为 `[]` |
 | 每类列表项 `name` | PEP 503 规范化包名 |
 | `before_version` / `after_version` | 前后锁中的 PEP 440 版本字符串；added/removed 时缺失一侧为 `null` |
-| `before_paths` / `after_paths` | 该包在**前 / 后依赖图**中从根包出发的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包在对应一侧**不存在时为空数组 `[]`**。变化项按 added → removed → upgraded/downgraded、各按包名的既有顺序逐个查询路径，某条查询的条数超过固定预算 1000 时整体返回 **409 / `status:"limit"`**（命中首个超限项），不构造任何路径列表 |
+| `before_paths` / `after_paths` | 该包在**前 / 后依赖图**中从根包出发的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包在对应一侧**不存在时为空数组 `[]`**。**一次请求所有变化项的路径条数跨 before/after 两侧共享请求级预算 1000**（added/removed 只计存在的一侧，升降级项前后两侧各计一次；按 added → removed → upgraded/downgraded、各按包名、项内先 before 后 after 的既有顺序逐个累计）：加入下一查询会使累计超过 1000 即整体返回 **409 / `status:"limit"`**（`target` 指向该变化项、`used` 固定 1001），不构造任何路径列表、不返回部分业务结果；恰好累计 1000 成功 |
 
 ```bash
 curl -s -X POST http://localhost:8000/lock-diff \
@@ -1532,12 +1541,19 @@ curl -s -X POST http://localhost:8000/lock-diff \
 排序，交换两份锁的提交位置时 `added` 与 `removed`、`upgraded` 与
 `downgraded` 对称互换，结果与包键 / 候选列表 / 锁键的输入顺序无关。
 
+路径条数预算是**请求级共享、跨 before/after 两侧累计**的：每个变化项
+存在一侧（或两侧）的最短路径都计入同一个 1000 上限，按既有确定性顺序
+逐个查询，加入下一查询会超限即整体 409（无部分结果）。因此即使每条
+单侧路径都只有几百条（如某升级项 before 1 条、after 600 条，下一升级
+项 before 500 条），累计越过 1000 仍会 409；截断位置只取决于变化项的
+确定性顺序，与输入键顺序无关。
+
 `/lock-diff` 的状态码：
 
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 两份锁均通过审计，差异比较完成（四类变化全为空表示根可达集与版本完全一致） |
-| `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较；或某变化项的最短路径条数超过固定预算 1000：`status: "limit"`，含 `target`（按 added → removed → upgraded/downgraded、各按包名的既有顺序命中的首个超限包）/ `used`（恒为 1001）/ `limit`，未构造路径列表 |
+| `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较；或所有变化项的最短路径条数跨 before/after 两侧累计超过请求级共享预算 1000：`status: "limit"`，含 `target`（按 added → removed → upgraded/downgraded、各按包名、项内先 before 后 after 的既有顺序，加入后会使累计超限的那个变化项）/ `used`（固定 1001）/ `limit`，不构造路径列表、不返回部分业务结果 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `before_lock` / `after_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
 
 ### `POST /explain-version`
@@ -1709,7 +1725,8 @@ curl -s -X POST http://localhost:8000/explain-version \
     遍历，路径按字典序确定性排序；目标为根包返回单节点路径，不可达返回
     `reachable: false` 与空路径。最短路径条数受固定预算 1000 约束：BFS
     建立最短前驱图后先按层做饱和计数，条数超限（饱和为 1001）即返回
-    409 `status:"limit"`，不构造路径列表。
+    409 `status:"limit"`，不构造路径列表。本接口为单目标查询，预算每次
+    请求独立重置（恰好 1000 条成功、1001 条 409）。
 12. **安装计划（`/install-plan`）**：先复用第 10 条的审计，锁无效即
     返回 409 且不生成批次；锁有效时只对根可达包按锁定版本的已激活依赖
     建图（与第 11 条同一张图，无版本选择），用 Kosaraju 算法求强连通
@@ -1749,8 +1766,10 @@ curl -s -X POST http://localhost:8000/explain-version \
     `(MIT)AND(Apache-2.0)` 等紧贴写法稳定报 422 并在错误信息中定位违规
     运算符与位置；标识词中的 AND/OR 字母片段（如 `ANDOR`）不被拆分。
     `violations` 与 `unknowns` 各自按包名排序，每项复用第 11 条的最短
-    路径算法附根包到该包的全部最短路径（同受固定条数预算 1000 约束：
-    命中包按包名顺序逐个查询，首个超限项即整体返回 409 `status:"limit"`）；
+    路径算法附根包到该包的全部最短路径（**一次请求所有命中包的路径条数
+    共享请求级预算 1000**：violations 与 unknowns 合在一起按包名顺序
+    逐个累计，加入下一目标会超限即整体返回 409 `status:"limit"`，
+    `used` 固定 1001、不返回部分结果；恰好累计 1000 成功）；
     非法 SPDX 表达式（含 `WITH`、运算符缺空白）、allow/deny 非法标识或
     两集合重叠返回 422，输出确定。
 16. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
@@ -1760,9 +1779,12 @@ curl -s -X POST http://localhost:8000/explain-version \
     图上只比较**根可达包**：after 独有为 added、before 独有为 removed、
     两侧均有则按 PEP 440 版本方向分为 upgraded / downgraded（等价版本
     不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
-    前后图中的全部最短根路径（同受固定条数预算 1000 约束：变化项按
-    added → removed → upgraded/downgraded、各按包名的既有顺序逐个查询，
-    首个超限项即整体返回 409 `status:"limit"`），不存在的一侧为空数组；
+    前后图中的全部最短根路径（**所有变化项的路径条数跨 before/after
+    两侧共享同一个请求级预算 1000**：added/removed 只计存在的一侧，
+    升降级项前后两侧各计一次，按 added → removed → upgraded/downgraded、
+    各按包名、项内先 before 后 after 的既有顺序逐个累计，加入下一查询
+    会超限即整体返回 409 `status:"limit"`，`used` 固定 1001、不返回
+    部分结果；恰好累计 1000 成功），不存在的一侧为空数组；
     四类列表各按包名排序、路径按字典序排序，交换提交位置结果对称，
     与输入顺序无关。
 17. **反事实版本解释（`/explain-version`）**：先按第 2～8 条的原规则求出
@@ -1804,8 +1826,14 @@ curl -s -X POST http://localhost:8000/explain-version \
   条数随层数指数增长，逐一构造路径列表会拖垮进程。BFS 建立最短前驱图后
   先按层做**饱和计数**（只累加条数、不构造路径），条数超过预算即饱和为
   1,001 并返回 `409 / status:"limit"`（含目标包、`used: 1001`、
-  `limit: 1000`），不构造路径列表；一次请求涉及多个目标时按既有包名顺序
-  稳定命中首个超限项。未超限的查询行为完全不变（全部最短路径照常返回）。
+  `limit: 1000`），不构造路径列表。预算作用域：`/dependency-paths` 为
+  **单目标查询**，预算每次请求独立（恰好 1,000 条成功、1,001 条 409）；
+  `/license-policy` 与 `/lock-diff` 一次请求要为多个目标返回路径，
+  **所有待返回的最短路径共享同一个请求级 1,000 条额度**——按各接口既有
+  的确定性目标顺序累计（`/lock-diff` 跨 before/after 两侧累计，升降级项
+  两侧各计一次），加入下一目标会使累计超过 1,000 即立即 409（`target`
+  指向该目标、`used` 固定 1,001），不返回部分业务结果；恰好累计到 1,000
+  的目标仍成功返回。截断位置只取决于确定性目标顺序，与输入键顺序无关。
 
 ## 四、项目结构
 
@@ -1815,7 +1843,7 @@ app/
   config.py         # 环境变量配置（MATRIX_ATTEMPT_LIMIT 请求级共享求解预算，启动时校验）
   resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建 / 跨环境共享尝试预算）
   audit.py          # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
-  paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全，固定条数预算 1000 + 按层饱和计数）
+  paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全，固定条数预算 1000 + 按层饱和计数；license-policy/lock-diff 共享请求级预算）
   install_plan.py   # 有效锁图 SCC 压缩为 DAG 与依赖优先并行安装批次（循环分量原子项）
   sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
   spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
