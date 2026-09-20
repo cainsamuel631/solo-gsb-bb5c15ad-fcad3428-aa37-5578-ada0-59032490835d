@@ -43,9 +43,10 @@
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
   有效则解析各可达包锁定版本 metadata.license 的 SPDX AND/OR/括号
   表达式，按请求的 allow/deny 标识集合做三态判定，返回按包名排序的
-  violations 与 unknowns（各附根包到该包的全部最短路径；某命中包
-  路径条数超过固定预算 1000 时整体返回 409 status=limit，按包名
-  顺序命中首个超限项）；
+  violations 与 unknowns（各附根包到该包的全部最短路径）；同请求所有
+  命中包的路径条数共享一个请求级 1000 条额度，按包名顺序累计，某命中
+  包自身超限或加入后累计超限时整体返回 409 status=limit（target 指向
+  首个超限目标，used 恒为 1001），不返回部分判定结果；
   非法 SPDX 表达式或 allow/deny 规则重叠返回 422
 * POST /lock-diff
   同一份仓库快照与目标环境下提交 before_lock、after_lock 两份锁定清单：
@@ -53,8 +54,10 @@
   before/after 的审计问题；均有效时只比较两份锁的根可达包，按规范化
   包名输出 added/removed/upgraded/downgraded（版本方向按 PEP 440），
   每个变化项附其在前后依赖图中的全部最短根路径（不存在的一侧为空数组）；
-  某变化项路径条数超过固定预算 1000 时整体返回 409 status=limit
-  （按既有包名顺序命中首个超限项）
+  同请求所有待返回路径（跨 before/after 两侧、跨全部变化项）共享一个
+  请求级 1000 条额度，按既有包名顺序、逐项先 before 后 after 累计，
+  某次查询自身超限或加入后累计超限时整体返回 409 status=limit
+  （target 指向首个超限目标，used 恒为 1001），不返回部分差异结果
 * POST /explain-version
   沿用 /resolve 的仓库、根约束与目标环境，先按原规则求出基准锁定清单
   （目标包不在其中即不可达，返回 422），再把 target_package 钉在
@@ -80,7 +83,12 @@ from .lock_groups import (
     lock_group_id,
     select_lock_groups,
 )
-from .paths import PathCountLimit, build_locked_graph, shortest_paths
+from .paths import (
+    PathCountLimit,
+    SharedPathBudget,
+    build_locked_graph,
+    shortest_paths,
+)
 from .repository import (
     Repository,
     SnapshotError,
@@ -246,14 +254,18 @@ def _path_limit_payload(exc: PathCountLimit) -> dict:
     """最短路径条数超限的 409 响应体（三个路径查询接口同形）。
 
     ``used`` 为饱和计数（恒为 limit+1）：分层菱形下真实条数随层数指数
-    增长，计数到 limit+1 即饱和停止，不构造任何路径列表。
+    增长，计数到 limit+1 即饱和停止，不构造任何路径列表。多目标接口
+    （/license-policy、/lock-diff）所有待返回目标共享同一个请求级
+    1000 条额度，按既有确定性目标顺序累计，加入触发目标会超限时同样
+    以本形态返回（``target`` 指向该目标），不返回任何部分业务结果。
     """
     return {
         "status": "limit",
         "message": (
-            f"根包到目标包 {exc.target!r} 的最短路径条数超过预算："
+            f"最短路径条数超过请求级共享预算（上限 {exc.limit} 条，"
+            f"一次请求的所有目标共享）：目标 {exc.target!r} 计入后超限，"
             f"饱和计数 {exc.used}，超过上限 {exc.limit}；"
-            "未构造路径列表"
+            "未构造任何路径列表，不返回部分结果"
         ),
         "target": exc.target,
         "used": exc.used,
@@ -979,8 +991,9 @@ def sbom_endpoint(request: SbomRequest):
             "model": InvalidLockResponse | PathLimitResponse,
             "description": (
                 "锁定清单未通过审计（status=invalid_lock）；"
-                "或某命中包的最短路径条数超过固定预算（status=limit，"
-                "按包名顺序命中首个超限项，未构造路径列表）"
+                "或所有命中包共享的请求级 1000 条路径额度被超过"
+                "（status=limit，按包名顺序累计命中首个超限目标，"
+                "used 恒为 1001，不构造路径列表、不返回部分结果）"
             ),
         },
         422: {
@@ -1033,9 +1046,11 @@ def license_policy_endpoint(request: LicensePolicyRequest):
         )
 
     # 规则集合（标识合法性、allow/deny 重叠）与许可证表达式均属于请求
-    # 语义校验：非法返回 422，输出不做任何判定。命中包的最短路径条数超过
-    # 固定预算时整体 409（status=limit）：判定按包名顺序逐包进行，命中的
-    # 是首个超限目标，未构造任何路径列表。
+    # 语义校验：非法返回 422，输出不做任何判定。所有命中包的最短路径条数
+    # 共享同一个请求级 1000 条额度：判定按包名顺序逐包进行，某命中包
+    # 自身超限或其条数加入累计后超限时整体 409（status=limit），命中的
+    # 是首个超限目标（used 恒为 1001），未构造任何路径列表、不返回部分
+    # 判定结果。
     try:
         allow_set, deny_set = parse_policy_sets(request.allow, request.deny)
         graph = build_locked_graph(
@@ -1048,6 +1063,7 @@ def license_policy_endpoint(request: LicensePolicyRequest):
             graph=graph,
             allow=allow_set,
             deny=deny_set,
+            budget=SharedPathBudget(),
         )
     except (SnapshotError, LicenseExpressionError) as exc:
         return JSONResponse(
@@ -1069,8 +1085,11 @@ def license_policy_endpoint(request: LicensePolicyRequest):
             "model": LockDiffInvalidResponse | PathLimitResponse,
             "description": (
                 "before_lock/after_lock 任一未通过审计（status=invalid_lock，"
-                "两侧问题分别标注）；或某变化项的最短路径条数超过固定预算"
-                "（status=limit，按既有包名顺序命中首个超限项，未构造路径列表）"
+                "两侧问题分别标注）；或所有待返回路径（跨 before/after 两侧、"
+                "跨全部变化项）共享的请求级 1000 条额度被超过"
+                "（status=limit，按既有包名顺序、逐项先 before 后 after "
+                "累计命中首个超限目标，used 恒为 1001，不构造路径列表、"
+                "不返回部分结果）"
             ),
         },
         422: {"model": InvalidSnapshotResponse, "description": "快照或任一锁非法"},
@@ -1150,15 +1169,19 @@ def lock_diff_endpoint(request: LockDiffRequest):
         )
 
     # 两份锁均有效：只比较根可达包，版本方向按 PEP 440；每个变化项附
-    # 前后依赖图中的全部最短根路径（不存在的一侧为空数组）。某条路径
-    # 查询超过固定条数预算时整体 409（status=limit）：变化项按既有
-    # 包名顺序逐个处理，命中的是首个超限目标，未构造任何路径列表。
+    # 前后依赖图中的全部最短根路径（不存在的一侧为空数组）。所有待返回
+    # 路径（跨 before/after 两侧、跨全部变化项）共享同一个请求级 1000
+    # 条额度：变化项按既有包名顺序、逐项先 before 后 after 逐个查询，
+    # 某次查询自身超限或加入累计后超限时整体 409（status=limit），命中
+    # 的是首个超限目标（used 恒为 1001），未构造任何路径列表、不返回
+    # 部分差异结果。
     try:
         document = diff_locks(
             repo,
             root_name=root_canonical,
             before_lock=before_lock,
             after_lock=after_lock,
+            budget=SharedPathBudget(),
         )
     except PathCountLimit as exc:
         return JSONResponse(status_code=409, content=_path_limit_payload(exc))

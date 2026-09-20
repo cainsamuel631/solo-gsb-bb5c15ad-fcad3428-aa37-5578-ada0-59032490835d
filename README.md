@@ -29,8 +29,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**，按请求的
 `allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
-某命中包的最短路径条数超过固定预算 **1000** 时整体返回
-**409 / `status:"limit"`**（按包名顺序命中首个超限项）；
+同请求**所有命中包共享一个请求级 1000 条路径额度**，按包名顺序累计，
+某命中包自身超限或加入后合计超限时整体返回
+**409 / `status:"limit"`**（`target` 指向首个超限目标，`used` 恒为
+1001），不返回部分判定结果；
 非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
 `/lock-diff` 在**同一份仓库快照与同一目标环境**下提交 `before_lock` 与
 `after_lock` 两份锁定清单：两份锁**各自独立复用 `/audit-lock` 的同一套
@@ -38,8 +40,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 均有效时**只比较根可达包**，按规范化包名输出 `added` / `removed` /
 `upgraded` / `downgraded`（版本方向按 PEP 440 判断），每个变化项同时
 给出其在前后依赖图中的**全部最短根路径**（不存在的一侧为空数组）；
-某变化项的最短路径条数超过固定预算 **1000** 时整体返回
-**409 / `status:"limit"`**（按既有包名顺序命中首个超限项）。
+同请求**所有待返回路径（跨 before/after 两侧、跨全部变化项）共享一个
+请求级 1000 条额度**，按既有包名顺序、逐项先 before 后 after 累计，
+某次查询自身超限或加入后合计超限时整体返回
+**409 / `status:"limit"`**（`target` 指向首个超限目标，`used` 恒为
+1001），不返回部分差异结果。
 `/explain-version` 做**反事实版本解释**：沿用 `/resolve` 的仓库、根约束
 与目标环境，先按原规则求出**基准锁**（目标包不可达返回 422），再把
 `target_package` 强制钉在 `target_version` 上整体重解——可行时返回新锁
@@ -1014,12 +1019,18 @@ curl -s -X POST http://localhost:8000/dependency-paths \
 ```json
 {
   "status": "limit",
-  "message": "根包到目标包 'shared-util' 的最短路径条数超过预算：饱和计数 1001，超过上限 1000；未构造路径列表",
+  "message": "最短路径条数超过请求级共享预算（上限 1000 条，一次请求的所有目标共享）：目标 'shared-util' 计入后超限，饱和计数 1001，超过上限 1000；未构造任何路径列表，不返回部分结果",
   "target": "shared-util",
   "used": 1001,
   "limit": 1000
 }
 ```
+
+> `/dependency-paths` 一次只查询一个目标，“请求级共享预算”对它而言就
+> 是这一个目标的条数；**恰好 1000 条时仍返回 200**（全部路径照常给出），
+> 只有第 1001 条起才返回 409。`/license-policy` 与 `/lock-diff` 一次
+> 请求包含多个目标，所有目标的条数**累计共享这 1000 条额度**（详见下文
+> 两节与文末“安全护栏”）。
 
 `/dependency-paths` 的状态码：
 
@@ -1297,7 +1308,7 @@ curl -s -X POST http://localhost:8000/sbom \
 | `root` | 规范化（PEP 503）后的根包名 |
 | `violations` | 判定为**拒绝**的包列表，**按规范化包名排序**；允许的包不出现 |
 | `unknowns` | 判定为**未知**的包列表（含未提供许可证的包），**按规范化包名排序** |
-| `violations[]` / `unknowns[]` | 每项为 `{"name", "license", "paths"}`：`name` 为规范化包名；`license` 为该包锁定版本的原始 SPDX 表达式文本（未提供时为 `null`）；`paths` 为根包到该包的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序；根包自身为单节点路径 `[root]`）。命中包按包名顺序逐个查询路径，某条查询的条数超过固定预算 1000 时整体返回 **409 / `status:"limit"`**（命中首个超限项），不构造任何路径列表 |
+| `violations[]` / `unknowns[]` | 每项为 `{"name", "license", "paths"}`：`name` 为规范化包名；`license` 为该包锁定版本的原始 SPDX 表达式文本（未提供时为 `null`）；`paths` 为根包到该包的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序；根包自身为单节点路径 `[root]`）。**同请求所有命中包共享一个请求级 1000 条路径额度**：命中包按包名顺序逐个查询并把条数累计进同一额度，某命中包自身条数超过 1000、或前面命中包的累计条数加入该包后超过 1000 时整体返回 **409 / `status:"limit"`**（`target` 为首个超限目标、`used` 恒为 1001），不构造任何路径列表、不返回部分 `violations` / `unknowns`；累计恰好 1000（含）以内仍正常返回 |
 
 ```bash
 curl -s -X POST http://localhost:8000/license-policy \
@@ -1368,7 +1379,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
-| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或某命中包的最短路径条数超过固定预算 1000：`status: "limit"`，含 `target`（按包名顺序命中的首个超限包）/ `used`（恒为 1001）/ `limit`，未构造路径列表 |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或同请求所有命中包共享的请求级 1000 条路径额度被超过：`status: "limit"`，含 `target`（按包名顺序累计时首个使合计超限的命中包；该包自身未必超过 1000）/ `used`（恒为 1001）/ `limit`，不构造路径列表、不返回部分结果 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`、`AND`/`OR` 任一侧缺少空白分隔，如 `MIT OR(Apache-2.0)`、`(MIT)AND(Apache-2.0)`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
 ### `POST /lock-diff`
@@ -1415,7 +1426,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | `added` / `removed` / `upgraded` / `downgraded` | 四类变化列表，各自**按规范化包名排序**；无变化时为 `[]` |
 | 每类列表项 `name` | PEP 503 规范化包名 |
 | `before_version` / `after_version` | 前后锁中的 PEP 440 版本字符串；added/removed 时缺失一侧为 `null` |
-| `before_paths` / `after_paths` | 该包在**前 / 后依赖图**中从根包出发的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包在对应一侧**不存在时为空数组 `[]`**。变化项按 added → removed → upgraded/downgraded、各按包名的既有顺序逐个查询路径，某条查询的条数超过固定预算 1000 时整体返回 **409 / `status:"limit"`**（命中首个超限项），不构造任何路径列表 |
+| `before_paths` / `after_paths` | 该包在**前 / 后依赖图**中从根包出发的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包在对应一侧**不存在时为空数组 `[]`**。**同请求所有待返回路径（跨 before/after 两侧、跨全部变化项）共享一个请求级 1000 条额度**：变化项按 added → removed → upgraded/downgraded、各按包名的既有顺序，逐项先查 before 侧再查 after 侧，把每次查询的条数累计进同一额度；某次查询自身超过 1000、或前面查询的累计加入该次后超过 1000 时整体返回 **409 / `status:"limit"`**（`target` 为首个超限目标、`used` 恒为 1001），不构造任何路径列表、不返回部分差异结果；累计恰好 1000（含）以内仍正常返回 |
 
 ```bash
 curl -s -X POST http://localhost:8000/lock-diff \
@@ -1537,7 +1548,7 @@ curl -s -X POST http://localhost:8000/lock-diff \
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 两份锁均通过审计，差异比较完成（四类变化全为空表示根可达集与版本完全一致） |
-| `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较；或某变化项的最短路径条数超过固定预算 1000：`status: "limit"`，含 `target`（按 added → removed → upgraded/downgraded、各按包名的既有顺序命中的首个超限包）/ `used`（恒为 1001）/ `limit`，未构造路径列表 |
+| `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较；或同请求所有待返回路径（跨 before/after 两侧、跨全部变化项）共享的请求级 1000 条额度被超过：`status: "limit"`，含 `target`（按 added → removed → upgraded/downgraded、各按包名、逐项先 before 后 after 的既有顺序累计时首个使合计超限的目标；该次查询自身未必超过 1000）/ `used`（恒为 1001）/ `limit`，不构造路径列表、不返回部分结果 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `before_lock` / `after_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
 
 ### `POST /explain-version`
@@ -1749,8 +1760,10 @@ curl -s -X POST http://localhost:8000/explain-version \
     `(MIT)AND(Apache-2.0)` 等紧贴写法稳定报 422 并在错误信息中定位违规
     运算符与位置；标识词中的 AND/OR 字母片段（如 `ANDOR`）不被拆分。
     `violations` 与 `unknowns` 各自按包名排序，每项复用第 11 条的最短
-    路径算法附根包到该包的全部最短路径（同受固定条数预算 1000 约束：
-    命中包按包名顺序逐个查询，首个超限项即整体返回 409 `status:"limit"`）；
+    路径算法附根包到该包的全部最短路径（**同请求所有命中包共享一个请求
+    级 1000 条额度**：命中包按包名顺序逐个查询并累计条数，某包自身超限
+    或加入后合计超限即整体返回 409 `status:"limit"`，`target` 指向首个
+    超限目标、`used` 恒为 1001，不返回部分判定结果；累计恰 1000 仍成功）；
     非法 SPDX 表达式（含 `WITH`、运算符缺空白）、allow/deny 非法标识或
     两集合重叠返回 422，输出确定。
 16. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
@@ -1760,9 +1773,13 @@ curl -s -X POST http://localhost:8000/explain-version \
     图上只比较**根可达包**：after 独有为 added、before 独有为 removed、
     两侧均有则按 PEP 440 版本方向分为 upgraded / downgraded（等价版本
     不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
-    前后图中的全部最短根路径（同受固定条数预算 1000 约束：变化项按
-    added → removed → upgraded/downgraded、各按包名的既有顺序逐个查询，
-    首个超限项即整体返回 409 `status:"limit"`），不存在的一侧为空数组；
+    前后图中的全部最短根路径（**同请求所有待返回路径——跨 before/after
+    两侧、跨全部变化项——共享一个请求级 1000 条额度**：变化项按
+    added → removed → upgraded/downgraded、各按包名的既有顺序，逐项
+    先 before 后 after 逐个查询并累计条数，某次查询自身超限或加入后
+    合计超限即整体返回 409 `status:"limit"`，`target` 指向首个超限
+    目标、`used` 恒为 1001，不返回部分差异结果；累计恰 1000 仍成功），
+    不存在的一侧为空数组；
     四类列表各按包名排序、路径按字典序排序，交换提交位置结果对称，
     与输入顺序无关。
 17. **反事实版本解释（`/explain-version`）**：先按第 2～8 条的原规则求出
@@ -1799,13 +1816,22 @@ curl -s -X POST http://localhost:8000/explain-version \
   上限）；非法配置在启动时失败。环境按 `id` 稳定顺序执行，输入重排不改变
   截断位置与响应。详见上文 `/resolve-matrix` 的“请求级求解预算”。
 - **依赖链深度上限**（默认 5,000 层）：超出同样以 `limit` 报出，而不是进程栈溢出。
-- **最短路径条数预算**（`/dependency-paths`、`/license-policy`、`/lock-diff`
-  共用，固定 1,000 条，不随配置变化）：分层菱形依赖下根到目标的最短路径
-  条数随层数指数增长，逐一构造路径列表会拖垮进程。BFS 建立最短前驱图后
-  先按层做**饱和计数**（只累加条数、不构造路径），条数超过预算即饱和为
-  1,001 并返回 `409 / status:"limit"`（含目标包、`used: 1001`、
-  `limit: 1000`），不构造路径列表；一次请求涉及多个目标时按既有包名顺序
-  稳定命中首个超限项。未超限的查询行为完全不变（全部最短路径照常返回）。
+- **请求级最短路径条数预算**（`/dependency-paths`、`/license-policy`、
+  `/lock-diff` 共用，固定 1,000 条，不随配置变化）：分层菱形依赖下根到
+  目标的最短路径条数随层数指数增长，逐一构造路径列表会拖垮进程。BFS
+  建立最短前驱图后先按层做**饱和计数**（只累加条数、不构造路径）：
+  `/dependency-paths` 为单目标查询，条数超过 1000 即饱和为 1,001 并
+  返回 `409 / status:"limit"`；`/license-policy`（多个命中包）与
+  `/lock-diff`（变化项的 before/after 两侧）一次请求包含多个目标，
+  **所有待返回路径共享同一个请求级 1,000 条额度**，按既有确定性目标
+  顺序（license-policy 按包名；lock-diff 按 added → removed →
+  upgraded/downgraded、各按包名、逐项先 before 后 after）逐个累计，
+  加入某目标会使合计超过 1,000 时立即返回 `409 / status:"limit"`
+  （`target` 指向该目标、`used` 恒为 1,001、`limit` 为 1,000），
+  **不构造任何路径列表、不返回部分业务结果**；即使每个目标各自都未
+  超过 1,000，合计超限同样拒绝。累计恰好 1,000（含）以内所有查询
+  行为完全不变（全部最短路径照常返回，单目标恰好 1,000 条也是
+  200）。截断位置只取决于目标集合与既有顺序，与输入键顺序无关。
 
 ## 四、项目结构
 

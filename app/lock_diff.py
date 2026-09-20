@@ -19,16 +19,21 @@ PEP 440 等价的版本（``1.0`` 与 ``1.0.0``）不产生变化项。每个变
 四类变化各自只取决于快照、目标环境与两份锁定清单，列表均按规范化包名
 排序；结果与输入（包键 / 候选列表 / 锁键）顺序无关。变化项按既有顺序
 （added → removed → upgraded/downgraded，各按包名）逐个查询最短路径，
-某条查询的条数超过固定预算（app.paths.PATH_COUNT_LIMIT）时抛
-:exc:`app.paths.PathCountLimit`（命中首个超限项），由路由层映射为
-409 ``status=limit``，不构造任何路径列表。
+每项的 before/after 两侧查询也按此前先 after（added）/先 before
+（removed）/先 before 后 after（升降级）的既有次序进行。**同一次请求
+所有待返回路径（跨 before/after 两侧、跨全部变化项）共享一个请求级
+条数预算**（app.paths.SharedPathBudget，总额
+app.paths.PATH_COUNT_LIMIT）：某侧查询自身条数超预算，或前面各查询的
+累计条数加入该侧后超过共享预算时抛 :exc:`app.paths.PathCountLimit`
+（命中首个超限项，``used`` 恒为 ``limit + 1``），由路由层映射为
+409 ``status=limit``，不构造任何路径列表、不返回部分差异结果。
 """
 
 from __future__ import annotations
 
 from packaging.version import Version
 
-from .paths import build_locked_graph, shortest_paths
+from .paths import SharedPathBudget, build_locked_graph, shortest_paths
 from .repository import Repository
 
 
@@ -38,15 +43,19 @@ def diff_locks(
     root_name: str,
     before_lock: dict[str, Version],
     after_lock: dict[str, Version],
+    budget: SharedPathBudget | None = None,
 ) -> dict:
     """比较两份**已通过审计**的锁定清单，返回四类根可达包变化。
 
     入参为同一份仓库快照与同一目标环境下解析出的两份锁（版本为 PEP 440
     Version）。返回 ``{"added", "removed", "upgraded", "downgraded"}``
     四个列表，各列表按规范化包名排序；每项含名称、前后版本与前后侧的
-    全部最短根路径（不可达一侧为 ``[]``）。某条最短路径查询超过固定
-    条数预算时抛 :exc:`app.paths.PathCountLimit`（按 added → removed →
-    upgraded/downgraded、各按包名的既有顺序命中首个超限项）。
+    全部最短根路径（不可达一侧为 ``[]``）。所有最短路径查询（跨
+    before/after 两侧、跨全部变化项）的条数按既有顺序累计进请求级共享
+    预算 ``budget``：某侧查询自身超限或累计超限（按 added → removed →
+    upgraded/downgraded、各按包名、逐项先 before 后 after 的既有顺序
+    命中的首个超限项）时抛 :exc:`app.paths.PathCountLimit`，``used``
+    恒为 ``limit + 1``，不构造任何路径列表。
     """
     before_graph = build_locked_graph(
         repo, root_name=root_name, current_lock=before_lock
@@ -68,7 +77,7 @@ def diff_locks(
             "before_version": None,
             "after_version": str(after_lock[name]),
             "before_paths": [],
-            "after_paths": shortest_paths(after_graph, root_name, name),
+            "after_paths": shortest_paths(after_graph, root_name, name, budget),
         })
 
     for name in sorted(before_reachable - after_reachable):
@@ -76,7 +85,7 @@ def diff_locks(
             "name": name,
             "before_version": str(before_lock[name]),
             "after_version": None,
-            "before_paths": shortest_paths(before_graph, root_name, name),
+            "before_paths": shortest_paths(before_graph, root_name, name, budget),
             "after_paths": [],
         })
 
@@ -86,12 +95,14 @@ def diff_locks(
         if old == new:
             # PEP 440 等价版本（1.0 与 1.0.0）不产生变化项。
             continue
+        # 共享预算跨 before/after 两侧累计：先查 before 侧、再查 after
+        # 侧，任一查询使累计超限即在此中止，命中目标为本变化项。
         entry = {
             "name": name,
             "before_version": str(old),
             "after_version": str(new),
-            "before_paths": shortest_paths(before_graph, root_name, name),
-            "after_paths": shortest_paths(after_graph, root_name, name),
+            "before_paths": shortest_paths(before_graph, root_name, name, budget),
+            "after_paths": shortest_paths(after_graph, root_name, name, budget),
         }
         if new > old:
             upgraded.append(entry)
